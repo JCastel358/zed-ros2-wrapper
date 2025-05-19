@@ -42,6 +42,8 @@ protected:
   void initServices();
   void initThreads();
 
+  void close();
+
   void getDebugParams();
   void getSimParams();
   void getGeneralParams();
@@ -79,12 +81,14 @@ protected:
   void stopSvoRecording();
   bool startStreamingServer();
   void stopStreamingServer();
+  void closeCamera();
   // <---- Initialization functions
 
   // ----> Callbacks
   void callback_pubFusedPc();
   void callback_pubPaths();
   void callback_pubTemp();
+  void callback_pubHeartbeat();
   void callback_gnssPubTimerTimeout();
   rcl_interfaces::msg::SetParametersResult callback_setParameters(
     std::vector<rclcpp::Parameter> parameters);
@@ -131,6 +135,10 @@ protected:
     const std::shared_ptr<rmw_request_id_t> request_header,
     const std::shared_ptr<std_srvs::srv::Trigger_Request> req,
     std::shared_ptr<std_srvs::srv::Trigger_Response> res);
+  void callback_setSvoFrame(
+    const std::shared_ptr<rmw_request_id_t> request_header,
+    const std::shared_ptr<zed_msgs::srv::SetSvoFrame_Request> req,
+    std::shared_ptr<zed_msgs::srv::SetSvoFrame_Response> res);
   void callback_clickedPoint(
     const geometry_msgs::msg::PointStamped::SharedPtr msg);
   void callback_gnssFix(const sensor_msgs::msg::NavSatFix::SharedPtr msg);
@@ -186,6 +194,10 @@ protected:
   void publishOdomTF(rclcpp::Time t);
   void publishPoseTF(rclcpp::Time t);
   bool publishSensorsData(rclcpp::Time force_ts = TIMEZERO_ROS);
+  void publishHealthStatus();
+  bool publishSvoStatus(uint64_t frame_ts);
+
+  void publishClock(const sl::Timestamp & ts);
   // <---- Publishing functions
 
   // ----> Utility functions
@@ -215,6 +227,7 @@ protected:
   void startFusedPcTimer(double fusedPcRate);
   void startPathPubTimer(double pathTimerRate);
   void startTempPubTimer();
+  void startHeartbeatTimer();
 
   template<typename T>
   void getParam(
@@ -245,6 +258,7 @@ private:
   // <---- Fusion module
 
   uint64_t mFrameCount = 0;
+  uint32_t mSvoLoopCount = 0;
 
   // ----> Topics
   std::string mTopicRoot = "~/";
@@ -284,6 +298,7 @@ private:
   bool _debugStreaming = false;
 
   int mCamSerialNumber = 0;
+  int mCamId = -1;
   bool mSimMode = false;     // Expecting simulation data?
   bool mUseSimTime = false;  // Use sim time?
   std::string mSimAddr =
@@ -300,31 +315,41 @@ private:
   unsigned int mSensFwVersion;               // Sensors FW version
   std::string mCameraName = "zed";           // Default camera name
   int mCamGrabFrameRate = 15;
+  bool mAsyncImageRetrieval = false;
+  int mImageValidityCheck = 1;
   std::string mSvoFilepath = "";
   bool mSvoLoop = false;
   bool mSvoRealtime = false;
+  int mSvoFrameStart = 0;
+  double mSvoRate = 1.0;
+  double mSvoExpectedPeriod = 0.0;
+  bool mUseSvoTimestamp = false;
+  bool mPublishSvoClock = false;
+  bool mGrabOnce = false;
+  bool mGrabImuOnce = false;
   int mVerbose = 1;
+  std::string mVerboseLogFile = "";
   int mGpuId = -1;
   std::string mOpencvCalibFile;
-  sl::RESOLUTION mCamResol =
-    sl::RESOLUTION::HD1080;    // Default resolution: RESOLUTION_HD1080
-  PubRes mPubResolution =
-    PubRes::NATIVE;                     // Use native grab resolution by default
+  sl::RESOLUTION mCamResol = sl::RESOLUTION::HD1080;    // Default resolution: RESOLUTION_HD1080
+  PubRes mPubResolution = PubRes::NATIVE;                     // Use native grab resolution by default
   double mCustomDownscaleFactor = 1.0;  // Used to rescale data with user factor
-  sl::DEPTH_MODE mDepthMode =
-    sl::DEPTH_MODE::ULTRA;      // Default depth mode: ULTRA
-  bool mDepthDisabled = false;  // Indicates if depth calculation is not
-                                // required (DEPTH_MODE::NONE)
+  bool mOpenniDepthMode =
+    false;    // 16 bit UC data in mm else 32F in m,
+              // for more info -> http://www.ros.org/reps/rep-0118.html
+  double mCamMinDepth = 0.1;
+  double mCamMaxDepth = 10.0;
+  sl::DEPTH_MODE mDepthMode = sl::DEPTH_MODE::NEURAL;
+  PcRes mPcResolution = PcRes::COMPACT;
+  bool mDepthDisabled = false;  // Indicates if depth calculation is not required (DEPTH_MODE::NONE)
   int mDepthStabilization = 1;
+
   int mCamTimeoutSec = 5;
   int mMaxReconnectTemp = 5;
   bool mCameraSelfCalib = true;
   bool mCameraFlip = false;
-  bool mOpenniDepthMode =
-    false;    // 16 bit UC data in mm else 32F in m,
-              // for more info -> http://www.ros.org/reps/rep-0118.html
-  double mCamMinDepth = 0.2;
-  double mCamMaxDepth = 10.0;
+
+
   bool mSensCameraSync = false;
   double mSensPubRate = 400.;
 
@@ -343,13 +368,14 @@ private:
   bool mAreaMemory = true;
   std::string mAreaMemoryDbPath = "";
   sl::POSITIONAL_TRACKING_MODE mPosTrkMode =
-    sl::POSITIONAL_TRACKING_MODE::GEN_2;
+    sl::POSITIONAL_TRACKING_MODE::GEN_1;
   bool mImuFusion = true;
   bool mFloorAlignment = false;
   bool mTwoDMode = false;
   double mFixedZValue = 0.0;
   std::vector<double> mInitialBasePose = std::vector<double>(6, 0.0);
   bool mResetOdomWhenLoopClosure = true;
+  bool mResetPoseWithSvoLoop = true;
   double mPathPubRate = 2.0;
   double mTfOffset = 0.05;
   double mPosTrackDepthMinRange = 0.0;
@@ -513,6 +539,7 @@ private:
   int mCamWidth;   // Camera frame width
   int mCamHeight;  // Camera frame height
   sl::Resolution mMatResol;
+  sl::Resolution mPcResol;
   // <---- Stereolabs Mat Info
 
   // Camera IMU transform
@@ -568,6 +595,8 @@ private:
   // <---- Messages
 
   // ----> Publishers
+  clockPub mPubClock;
+
   image_transport::CameraPublisher mPubRgb;
   image_transport::CameraPublisher mPubRawRgb;
   image_transport::CameraPublisher mPubLeft;
@@ -595,6 +624,9 @@ private:
   pointcloudPub mPubFusedCloud;
 #endif
 
+  svoStatusPub mPubSvoStatus;
+  healthStatusPub mPubHealthStatus;
+  heartbeatStatusPub mPubHeartbeatStatus;
   imagePub mPubConfMap;
   disparityPub mPubDisparity;
   posePub mPubPose;
@@ -681,6 +713,7 @@ private:
   rclcpp::TimerBase::SharedPtr
     mTempPubTimer;    // Timer to retrieve and publish CMOS temperatures
   rclcpp::TimerBase::SharedPtr mGnssPubCheckTimer;
+  rclcpp::TimerBase::SharedPtr mHeartbeatTimer;
   double mSensRateComp = 1.0;
   // <---- Threads and Timers
 
@@ -699,6 +732,8 @@ private:
   bool mDebugMode = false;  // Debug mode active?
   bool mSvoMode = false;
   bool mSvoPause = false;
+  int mSvoFrameId = 0;
+  int mSvoFrameCount = 0;
   bool mPosTrackingStarted = false;
   bool mVdPublishing = false;  // Indicates if video and depth data are
                                // subscribed and then published
@@ -732,7 +767,9 @@ private:
 
   std::atomic<bool> mStreamingServerRunning;
 
+  bool mUsingCustomOd = false;
   bool mCustomLabelsGood = false;
+  uint64_t mHeartbeatCount = 0;
   // <---- Status Flags
 
   // ----> Positional Tracking
@@ -755,6 +792,7 @@ private:
   // <---- Positional Tracking
 
   // ----> Diagnostic
+  sl_tools::StopWatch mUptimer;
   float mTempImu = NOT_VALID_TEMP;
   float mTempLeft = NOT_VALID_TEMP;
   float mTempRight = NOT_VALID_TEMP;
@@ -819,7 +857,7 @@ private:
 
   // ----> SVO Recording parameters
   unsigned int mSvoRecBitrate = 0;
-  sl::SVO_COMPRESSION_MODE mSvoRecCompr = sl::SVO_COMPRESSION_MODE::H264;
+  sl::SVO_COMPRESSION_MODE mSvoRecCompression = sl::SVO_COMPRESSION_MODE::H265;
   unsigned int mSvoRecFramerate = 0;
   bool mSvoRecTranscode = false;
   std::string mSvoRecFilename;
@@ -835,11 +873,14 @@ private:
   startSvoRecSrvPtr mStartSvoRecSrv;
   stopSvoRecSrvPtr mStopSvoRecSrv;
   pauseSvoSrvPtr mPauseSvoSrv;
+  setSvoFramePtr mSetSvoFrameSrv;
   setRoiSrvPtr mSetRoiSrv;
   resetRoiSrvPtr mResetRoiSrv;
   toLLSrvPtr mToLlSrv;
   fromLLSrvPtr mFromLlSrv;
   enableStreamingPtr mEnableStreamingSrv;
+
+  sl_tools::StopWatch mSetSvoFrameCheckTimer;
   // <---- Services
 
   // ----> Services names
@@ -853,6 +894,7 @@ private:
   const std::string mSrvStartSvoRecName = "start_svo_rec";
   const std::string mSrvStopSvoRecName = "stop_svo_rec";
   const std::string mSrvToggleSvoPauseName = "toggle_svo_pause";
+  const std::string mSrvSetSvoFrameName = "set_svo_frame";
   const std::string mSrvSetRoiName = "set_roi";
   const std::string mSrvResetRoiName = "reset_roi";
   const std::string mSrvToLlName = "toLL";  // Convert from `map` to `Lat Long`

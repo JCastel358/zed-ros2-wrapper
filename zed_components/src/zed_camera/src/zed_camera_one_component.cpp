@@ -47,7 +47,8 @@ ZedCameraOne::ZedCameraOne(const rclcpp::NodeOptions & options)
   _imuRawSubCount(0),
   _streamingServerRequired(false),
   _streamingServerRunning(false),
-  _triggerUpdateDynParams(true)
+  _triggerUpdateDynParams(true),
+  _uptimer(get_clock())
 {
   RCLCPP_INFO(get_logger(), "********************************");
   RCLCPP_INFO(get_logger(), "    ZED Camera One Component    ");
@@ -74,7 +75,7 @@ ZedCameraOne::ZedCameraOne(const rclcpp::NodeOptions & options)
         << ZED_SDK_MINOR_VERSION << "."
         << ZED_SDK_PATCH_VERSION << "-"
         << ZED_SDK_BUILD_ID);
-    RCLCPP_INFO(get_logger(), "Node stopped");
+    RCLCPP_INFO(get_logger(), "Node stopped. Press Ctrl+C to exit.");
     exit(EXIT_FAILURE);
   }
 
@@ -98,8 +99,11 @@ ZedCameraOne::ZedCameraOne(const rclcpp::NodeOptions & options)
 
 ZedCameraOne::~ZedCameraOne()
 {
-  DEBUG_STREAM_COMM("Destroying node");
+  close();
+}
 
+void ZedCameraOne::close()
+{
   DEBUG_STREAM_SENS("Stopping temperatures timer");
   if (_tempPubTimer) {
     _tempPubTimer->cancel();
@@ -133,10 +137,21 @@ ZedCameraOne::~ZedCameraOne()
   // <---- Verify that all the threads are not active
 
   // ----> Close the ZED camera
-  DEBUG_STREAM_COMM("Closing ZED camera...");
-  _zed->close();
-  DEBUG_STREAM_COMM("... ZED camera closed");
+  closeCamera();
   // <---- Close the ZED camera
+}
+
+void ZedCameraOne::closeCamera()
+{
+  if (_zed == nullptr) {
+    return;
+  }
+
+  RCLCPP_INFO(get_logger(), "***** CLOSING CAMERA *****");
+
+  _zed->close();
+  _zed.reset();
+  DEBUG_COMM("Camera closed");
 }
 
 void ZedCameraOne::initParameters()
@@ -187,7 +202,10 @@ void ZedCameraOne::getGeneralParams()
     RCLCPP_INFO_STREAM(get_logger(), " * SVO: '" << _svoFilepath.c_str() << "'");
     _svoMode = true;
     getParam("svo.svo_loop", _svoLoop, _svoLoop, " * SVO Loop: ");
-    getParam("svo.svo_realtime", _svoRealtime, _svoRealtime, );
+    getParam("svo.svo_realtime", _svoRealtime, _svoRealtime, " * SVO Real Time: ");
+    getParam(
+      "svo.use_svo_timestamps", _useSvoTimestamp, _useSvoTimestamp,
+      " * Use SVO timestamp: ");
   }
 #endif
 
@@ -258,12 +276,13 @@ void ZedCameraOne::getGeneralParams()
     get_logger(), " * Camera model: " << camera_model << " - " << _camUserModel);
 
   getParam("general.camera_name", _cameraName, _cameraName, " * Camera name: ");
+
   getParam(
     "general.serial_number", _camSerialNumber, _camSerialNumber,
     " * Camera SN: ");
   getParam(
-    "general.camera_timeout_sec", _openTimeout_sec, _openTimeout_sec,
-    " * Camera timeout [sec]: ", false, 1, 60);
+    "general.camera_id", _camId, _camId,
+    " * Camera ID: ");
   getParam(
     "general.grab_frame_rate", _camGrabFrameRate, _camGrabFrameRate,
     " * Camera framerate: ", false, 15, 120);
@@ -433,6 +452,9 @@ void ZedCameraOne::getDebugParams()
   RCLCPP_INFO(get_logger(), "*** DEBUG parameters ***");
 
   getParam("debug.sdk_verbose", _sdkVerbose, _sdkVerbose, " * SDK Verbose: ", false, 0, 1000);
+  getParam(
+    "debug.sdk_verbose_log_file", _sdkVerboseLogFile, _sdkVerboseLogFile,
+    " * SDK Verbose File: ");
 
   getParam("debug.debug_common", _debugCommon, _debugCommon, " * Debug Common: ");
   getParam("debug.debug_video_depth", _debugVideoDepth, _debugVideoDepth, " * Debug Image/Depth: ");
@@ -587,6 +609,19 @@ void ZedCameraOne::init()
   }
   // <---- Start camera
 
+  // Callback when the node is destroyed
+  // This is used to stop the camera when the node is destroyed
+  // and to stop the timers
+
+  // Close camera callback before shutdown
+  using rclcpp::contexts::get_global_default_context;
+  get_global_default_context()->add_pre_shutdown_callback(
+    [this]() {
+      DEBUG_COMM("ZED X One Component is shutting down");
+      close();
+      DEBUG_COMM("ZED X One Component is shutting down - done");
+    });
+
   // Dynamic parameters callback
   _paramChangeCallbackHandle = add_on_set_parameters_callback(
     std::bind(&ZedCameraOne::callback_setParameters, this, _1));
@@ -609,7 +644,7 @@ void ZedCameraOne::initServices()
 #if ENABLE_SVO
   // Start SVO Recording
   srv_name = srv_prefix + _srvStartSvoRecName;
-  _srvStartSvoRec = create_service<zed_interfaces::srv::StartSvoRec>(
+  _srvStartSvoRec = create_service<zed_msgs::srv::StartSvoRec>(
     srv_name,
     std::bind(&ZedCameraOne::callback_startSvoRec, this, _1, _2, _3));
   RCLCPP_INFO(get_logger(), " * '%s'", _srvStartSvoRec->get_service_name());
@@ -678,7 +713,9 @@ bool ZedCameraOne::startCamera()
     _initParams.camera_resolution = static_cast<sl::RESOLUTION>(_camResol);
 
     if (_camSerialNumber > 0) {
-      _initParams.input.setFromSerialNumber(_camSerialNumber);
+      _initParams.input.setFromSerialNumber(_camSerialNumber, sl::BUS_TYPE::GMSL);
+    } else if (_camId >= 0) {
+      _initParams.input.setFromCameraID(_camId, sl::BUS_TYPE::GMSL, sl::CAMERA_TYPE::MONO);
     }
   }
 
@@ -690,11 +727,11 @@ bool ZedCameraOne::startCamera()
   _initParams.coordinate_system = ROS_COORDINATE_SYSTEM;
   _initParams.coordinate_units = ROS_MEAS_UNITS;
   _initParams.enable_hdr = _enableHDR;
-  _initParams.open_timeout_sec = _openTimeout_sec;
   if (!_opencvCalibFile.empty()) {
     _initParams.optional_opencv_calibration_file = _opencvCalibFile.c_str();
   }
   _initParams.sdk_verbose = _sdkVerbose;
+  _initParams.sdk_verbose_log_file = _sdkVerboseLogFile.c_str();
   // <---- ZED configuration
 
   // ----> Try to connect to a camera, to a stream, or to load an SVO
@@ -741,6 +778,9 @@ bool ZedCameraOne::startCamera()
     DEBUG_STREAM_COMM("Opening successfull");
   }
   // ----> Try to connect to a camera, to a stream, or to load an SVO
+
+  // Initialize Up timer
+  _uptimer.tic();
 
   // ----> Camera information
   sl::CameraOneInformation camInfo = _zed->getCameraInformation();
@@ -792,7 +832,7 @@ bool ZedCameraOne::startCamera()
 #if ENABLE_SVO
   if (_svoMode) {
     RCLCPP_INFO(
-      get_logger(), " * SVO resolution\t-> %ldx%ld",
+      get_logger(), " * SVO resolution\t-> %dx%d",
       camInfo.camera_configuration.resolution.width,
       camInfo.camera_configuration.resolution.height);
     RCLCPP_INFO_STREAM(
@@ -866,8 +906,12 @@ bool ZedCameraOne::startCamera()
   // Initialialized timestamp to avoid wrong initial data
   // ----> Timestamp
   if (_svoMode) {
-    _frameTimestamp =
-      sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::CURRENT));
+    if (_useSvoTimestamp) {
+      _frameTimestamp = sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::IMAGE));
+    } else {
+      _frameTimestamp =
+        sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::CURRENT));
+    }
   } else {
     _frameTimestamp =
       sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::IMAGE));
@@ -954,7 +998,7 @@ void ZedCameraOne::callback_pubTemp()
 
   // ----> Publish temperature
   if (tempSubCount > 0) {
-    tempMsgPtr imuTempMsg = std::make_unique<sensor_msgs::msg::Temperature>();
+    auto imuTempMsg = std::make_unique<sensor_msgs::msg::Temperature>();
 
     imuTempMsg->header.stamp = get_clock()->now();
 
@@ -986,6 +1030,8 @@ void ZedCameraOne::callback_updateDiagnostic(
     return;
   }
 
+  stat.addf("Uptime", "%s", sl_tools::seconds2str(_uptimer.toc()).c_str());
+
   if (_grabStatus == sl::ERROR_CODE::SUCCESS) {
     double freq = 1. / _grabPeriodMean_sec->getAvg();
     double freq_perc = 100. * freq / _camGrabFrameRate;
@@ -1012,6 +1058,15 @@ void ZedCameraOne::callback_updateDiagnostic(
         diagnostic_msgs::msg::DiagnosticStatus::OK,
         "Camera grabbing");
     }
+
+    // ----> Frame drop count
+    auto dropped = _zed->getFrameDroppedCount();
+    uint64_t total = dropped + _frameCount;
+    auto perc_drop = 100. * static_cast<double>(dropped) / total;
+    stat.addf(
+      "Frame Drop rate", "%u/%lu (%g%%)",
+      dropped, total, perc_drop);
+    // <---- Frame drop count
 
 #if ENABLE_SVO
     if (_svoMode) {
@@ -1062,7 +1117,7 @@ void ZedCameraOne::callback_updateDiagnostic(
   } else {
     stat.summaryf(
       diagnostic_msgs::msg::DiagnosticStatus::ERROR,
-      "Camera error: %s", sl::toString(_grabStatus).c_str());
+      "%s", sl::toString(_grabStatus).c_str());
   }
 
   if (_imuPublishing) {
@@ -1732,7 +1787,7 @@ void ZedCameraOne::threadFunc_zedGrab()
               get_logger(),
               "Connection issue detected: "
                 << sl::toString(_grabStatus).c_str());
-            rclcpp::sleep_for(1000ms);
+            rclcpp::sleep_for(1s);
             continue;
           } else if (_grabStatus == sl::ERROR_CODE::CAMERA_NOT_INITIALIZED ||
             _grabStatus == sl::ERROR_CODE::FAILURE)
@@ -1742,7 +1797,7 @@ void ZedCameraOne::threadFunc_zedGrab()
               "Camera issue detected: "
                 << sl::toString(_grabStatus).c_str() << ". " << sl::toVerbose(
                 _grabStatus).c_str() << ". Trying to recover the connection...");
-            rclcpp::sleep_for(1000ms);
+            rclcpp::sleep_for(1s);
             continue;
           } else {
             RCLCPP_ERROR_STREAM(
@@ -1761,8 +1816,12 @@ void ZedCameraOne::threadFunc_zedGrab()
 
         // ----> Timestamp
         if (_svoMode) {
-          _frameTimestamp = sl_tools::slTime2Ros(
-            _zed->getTimestamp(sl::TIME_REFERENCE::CURRENT));
+          if (_useSvoTimestamp) {
+            _frameTimestamp = sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::IMAGE));
+          } else {
+            _frameTimestamp =
+              sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::CURRENT));
+          }
         } else {
           _frameTimestamp =
             sl_tools::slTime2Ros(_zed->getTimestamp(sl::TIME_REFERENCE::IMAGE));
@@ -1928,16 +1987,14 @@ void ZedCameraOne::threadFunc_pubSensorsData()
       // std::lock_guard<std::mutex> lock(mCloseZedMutex);
       if (!_zed->isOpened()) {
         DEBUG_STREAM_SENS("[threadFunc_pubSensorsData] the camera is not open");
-        rclcpp::sleep_for(
-          std::chrono::milliseconds(200));    // Avoid busy-waiting
+        rclcpp::sleep_for(200ms);    // Avoid busy-waiting
         continue;
       }
 
       _imuPublishing = areSensorsTopicsSubscribed();
 
       if (!_imuPublishing && !_publishImuTF) {
-        rclcpp::sleep_for(
-          std::chrono::milliseconds(200));    // Avoid busy-waiting
+        rclcpp::sleep_for(200ms);    // Avoid busy-waiting
         continue;
       }
 
@@ -2089,7 +2146,8 @@ void ZedCameraOne::applyDynamicSettings()
         rclcpp::Parameter("video.auto_exposure_time_range_max", _camExpTime)
       });
     DEBUG_STREAM_COMM(
-      "Forced video.auto_exposure to false and exposure range to [" << _camExpTime << "," << _camExpTime <<
+      "Forced video.auto_exposure to false and exposure range to [" << _camExpTime << "," <<
+        _camExpTime <<
         "]");
   }
   _camDynParMapChanged["video.auto_exposure"] = false;
@@ -2141,7 +2199,8 @@ void ZedCameraOne::applyDynamicSettings()
         rclcpp::Parameter("video.auto_analog_gain_range_max", _camAnalogGain)
       });
     DEBUG_STREAM_COMM(
-      "Forced video.auto_analog_gain to false and analog gain range to [" << _camAnalogGain << "," << _camAnalogGain <<
+      "Forced video.auto_analog_gain to false and analog gain range to [" << _camAnalogGain <<
+        "," << _camAnalogGain <<
         "]");
   }
   _camDynParMapChanged["video.auto_analog_gain"] = false;
@@ -2195,7 +2254,8 @@ void ZedCameraOne::applyDynamicSettings()
         rclcpp::Parameter("video.auto_digital_gain_range_max", _camDigitalGain)
       });
     DEBUG_STREAM_COMM(
-      "Forced video.auto_digital_gain to false and digital gain range to [" << _camDigitalGain << "," << _camDigitalGain <<
+      "Forced video.auto_digital_gain to false and digital gain range to [" << _camDigitalGain <<
+        "," << _camDigitalGain <<
         "]");
   }
   _camDynParMapChanged["video.auto_digital_gain"] = false;
@@ -2355,7 +2415,7 @@ bool ZedCameraOne::publishSensorsData()
       "[publishSensorsData] IMU subscribers: "
         << static_cast<int>(_imuSubCount));
 
-    imuMsgPtr imuMsg = std::make_unique<sensor_msgs::msg::Imu>();
+    auto imuMsg = std::make_unique<sensor_msgs::msg::Imu>();
 
     imuMsg->header.stamp = ts_imu;
     imuMsg->header.frame_id = _imuFrameId;
@@ -2428,7 +2488,7 @@ bool ZedCameraOne::publishSensorsData()
       "[publishSensorsData] IMU subscribers: "
         << static_cast<int>(_imuRawSubCount));
 
-    imuMsgPtr imuRawMsg = std::make_unique<sensor_msgs::msg::Imu>();
+    auto imuRawMsg = std::make_unique<sensor_msgs::msg::Imu>();
 
     imuRawMsg->header.stamp = ts_imu;
     imuRawMsg->header.frame_id = _imuFrameId;
@@ -2606,7 +2666,8 @@ void ZedCameraOne::retrieveImages()
       _zed->retrieveImage(_matColor, sl::VIEW::LEFT, sl::MEM::CPU, _matResol));
     _sdkGrabTS = _matColor.timestamp;
     DEBUG_STREAM_VD(
-      "Color image " << _matResol.width << "x" << _matResol.height << " retrieved - timestamp: " << _sdkGrabTS.getNanoseconds() <<
+      "Color image " << _matResol.width << "x" << _matResol.height << " retrieved - timestamp: " <<
+        _sdkGrabTS.getNanoseconds() <<
         " nsec");
   }
   if (_colorRawSubCount > 0) {
@@ -2616,7 +2677,8 @@ void ZedCameraOne::retrieveImages()
         sl::MEM::CPU, _matResol));
     _sdkGrabTS = _matColorRaw.timestamp;
     DEBUG_STREAM_VD(
-      "Color raw image " << _matResol.width << "x" << _matResol.height << " retrieved - timestamp: " << _sdkGrabTS.getNanoseconds() <<
+      "Color raw image " << _matResol.width << "x" << _matResol.height <<
+        " retrieved - timestamp: " << _sdkGrabTS.getNanoseconds() <<
         " nsec");
   }
 #if ENABLE_GRAY_IMAGE
@@ -2627,7 +2689,8 @@ void ZedCameraOne::retrieveImages()
         sl::MEM::CPU, _matResol));
     _sdkGrabTS = _matGray.timestamp;
     DEBUG_STREAM_VD(
-      "Gray image " << _matResol.width << "x" << _matResol.height << " retrieved - timestamp: " << _sdkGrabTS.getNanoseconds() <<
+      "Gray image " << _matResol.width << "x" << _matResol.height << " retrieved - timestamp: " <<
+        _sdkGrabTS.getNanoseconds() <<
         " nsec");
   }
   if (_grayRawSubCount > 0) {
@@ -2636,9 +2699,10 @@ void ZedCameraOne::retrieveImages()
       _zed->retrieveImage(
         _matGrayRaw, sl::VIEW::LEFT_UNRECTIFIED_GRAY,
         sl::MEM::CPU, _matResol));
-    _sdkGrabTS = _matGray.timestamp;
+    _sdkGrabTS = _matGrayRaw.timestamp;
     DEBUG_STREAM_VD(
-      "Gray raw image " << _matResol.width << "x" << _matResol.height << " retrieved - timestamp: " << _sdkGrabTS.getNanoseconds() <<
+      "Gray raw image " << _matResol.width << "x" << _matResol.height <<
+        " retrieved - timestamp: " << _sdkGrabTS.getNanoseconds() <<
         " nsec");
   }
 #endif
@@ -2722,7 +2786,7 @@ void ZedCameraOne::publishImages()
 
   // ----> Publish the GRAY RAW image if someone has subscribed to
   if (_grayRawSubCount > 0) {
-    DEBUG_STREAM_VD("_grayRawSubCount: " << _graySubCount);
+    DEBUG_STREAM_VD("_grayRawSubCount: " << _grayRawSubCount);
     publishImageWithInfo(
       _matGrayRaw, _pubGrayRawImg, _camInfoRawMsg,
       _camImgFrameId, timeStamp);
@@ -2816,8 +2880,8 @@ void ZedCameraOne::callback_enableStreaming(
 #if ENABLE_SVO
 void ZedCameraOne::callback_startSvoRec(
   const std::shared_ptr<rmw_request_id_t> request_header,
-  const std::shared_ptr<zed_interfaces::srv::StartSvoRec_Request> req,
-  std::shared_ptr<zed_interfaces::srv::StartSvoRec_Response> res)
+  const std::shared_ptr<zed_msgs::srv::StartSvoRec_Request> req,
+  std::shared_ptr<zed_msgs::srv::StartSvoRec_Response> res)
 {
   (void)request_header;
 
@@ -2872,7 +2936,7 @@ void ZedCameraOne::callback_startSvoRec(
   _svoRecFilename = req->svo_filename;
 
   if (_svoRecFilename.empty()) {
-    _svoRecFilename = "zed.svo";
+    _svoRecFilename = "zed.svo2";
   }
 
   std::string err;
@@ -2892,7 +2956,7 @@ void ZedCameraOne::callback_startSvoRec(
     " * Input Transcode: " << (_svoRecTranscode ? "TRUE" : "FALSE"));
   RCLCPP_INFO_STREAM(
     get_logger(), " * Filename: " << (_svoRecFilename.empty() ?
-    "zed.svo" :
+    "zed.svo2" :
     _svoRecFilename));
 
   res->message = "SVO Recording started";

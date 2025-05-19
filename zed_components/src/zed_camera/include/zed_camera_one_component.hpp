@@ -15,6 +15,10 @@
 #ifndef ZED_CAMERA_ONE_COMPONENT_HPP_
 #define ZED_CAMERA_ONE_COMPONENT_HPP_
 
+#define ENABLE_GRAY_IMAGE 1
+#define ENABLE_STREAM_INPUT 1
+#define ENABLE_SVO 0
+
 #include <atomic>
 #include <sl/CameraOne.hpp>
 
@@ -22,9 +26,6 @@
 #include "sl_types.hpp"
 #include "visibility_control.hpp"
 
-#define ENABLE_GRAY_IMAGE 0
-#define ENABLE_SVO 0
-#define ENABLE_STREAM_INPUT 0
 
 namespace stereolabs
 {
@@ -53,7 +54,10 @@ protected:
   void getStreamingServerParams();
   void getAdvancedParams();
 
+  void close();
+
   bool startCamera();
+  void closeCamera();
   void startTempPubTimer();
   bool startStreamingServer();
   void stopStreamingServer();
@@ -103,8 +107,8 @@ protected:
 #if ENABLE_SVO
   void callback_startSvoRec(
     const std::shared_ptr<rmw_request_id_t> request_header,
-    const std::shared_ptr<zed_interfaces::srv::StartSvoRec_Request> req,
-    std::shared_ptr<zed_interfaces::srv::StartSvoRec_Response> res);
+    const std::shared_ptr<zed_msgs::srv::StartSvoRec_Request> req,
+    std::shared_ptr<zed_msgs::srv::StartSvoRec_Response> res);
   void callback_stopSvoRec(
     const std::shared_ptr<rmw_request_id_t> request_header,
     const std::shared_ptr<std_srvs::srv::Trigger_Request> req,
@@ -211,12 +215,13 @@ private:
   double _customDownscaleFactor = 1.0;  // Used to rescale data with user factor
   bool _cameraFlip = false; // Camera flipped?
   bool _enableHDR = false; // Enable HDR if supported?
-  int _openTimeout_sec = 5; // Camera open timeout
   std::string _opencvCalibFile; // Custom OpenCV calibration file
   int _sdkVerbose = 0; // SDK verbose level
+  std::string _sdkVerboseLogFile = ""; // SDK Verbose Log file
   int _gpuId = -1; // GPU ID
 
   int _camSerialNumber = 0; // Camera serial number
+  int _camId = -1; // Camera ID
 
   sl::MODEL _camUserModel = sl::MODEL::ZED_XONE_GS;  // Default camera model
 
@@ -276,6 +281,7 @@ private:
   bool _debugMode = false;  // Debug mode active?
   bool _svoMode = false;        // Input from SVO?
   bool _svoPause = false;       // SVO pause status
+  bool _useSvoTimestamp = false; // Use SVO timestamp
   bool _streamMode = false;     // Expecting local streaming data?
 
   std::atomic<bool> _triggerUpdateDynParams;  // Trigger auto exposure/gain
@@ -325,6 +331,8 @@ private:
 
   // ----> Diagnostic variables
   diagnostic_updater::Updater _diagUpdater;  // Diagnostic Updater
+
+  sl_tools::StopWatch _uptimer;
 
   sl::ERROR_CODE _connStatus = sl::ERROR_CODE::LAST; // Connection status
   sl::ERROR_CODE _grabStatus = sl::ERROR_CODE::LAST; // Grab status
